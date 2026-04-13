@@ -8,15 +8,27 @@ import tempfile
 import networkx as nx
 from loguru import logger
 from lean_dojo import Pos
-import pytorch_lightning as pl
+try:
+    import pytorch_lightning as pl
+except ImportError:
+    pl = None
 from dataclasses import dataclass, field
-from pytorch_lightning.utilities.deepspeed import (
-    convert_zero_checkpoint_to_fp32_state_dict,
-)
+try:
+    from pytorch_lightning.utilities.deepspeed import (
+        convert_zero_checkpoint_to_fp32_state_dict,
+    )
+except ImportError:
+    convert_zero_checkpoint_to_fp32_state_dict = None
 from transformers import get_constant_schedule_with_warmup
-from deepspeed.ops.adam import FusedAdam, DeepSpeedCPUAdam
+try:
+    from deepspeed.ops.adam import FusedAdam, DeepSpeedCPUAdam
+except ImportError:
+    FusedAdam = DeepSpeedCPUAdam = None
 from typing import Optional, List, Dict, Any, Tuple, Generator
-from pytorch_lightning.strategies.deepspeed import DeepSpeedStrategy
+try:
+    from pytorch_lightning.strategies.deepspeed import DeepSpeedStrategy
+except ImportError:
+    DeepSpeedStrategy = None
 
 
 Example = Dict[str, Any]

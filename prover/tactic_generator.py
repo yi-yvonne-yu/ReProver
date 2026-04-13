@@ -182,16 +182,81 @@ class HuggingFaceGenerator(TacticGenerator):
         self.max_oup_seq_len = max_oup_seq_len
         self.length_penalty = length_penalty
         self.template = template
+        self._initialized = False
 
     def initialize(self) -> None:
+        if self._initialized:
+            logger.info("Tactic generator already initialized. Skipping reload.")
+            return
+        
+        logger.info(f"FIRST-TIME INITIALIZATION: Loading model from {self.model_path}...")
+        
+        # Try Causal LM first as it is more common for our current provers (DeepSeek, InternLM, etc.)
+        # and more likely to be what the user is using.
         try:
-            self.generator = AutoModelForSeq2SeqLM.from_pretrained(self.model_path)
-            self.decoder_only = False
-        except ValueError:
-            self.generator = AutoModelForCausalLM.from_pretrained(self.model_path)
-            self.decoder_only = True
+            import torch
+            from transformers import AutoConfig
+            config = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
+            
+            # Check if it's likely a decoder-only model
+            is_decoder_only = True
+            if hasattr(config, "is_encoder_decoder") and config.is_encoder_decoder:
+                is_decoder_only = False
+            
+            if is_decoder_only:
+                model_kwargs = {
+                    "torch_dtype": torch.bfloat16,
+                    "trust_remote_code": True,
+                    "device_map": "auto",
+                }
+                try:
+                    self.generator = AutoModelForCausalLM.from_pretrained(
+                        self.model_path, 
+                        attn_implementation="flash_attention_2",
+                        **model_kwargs
+                    )
+                    logger.info("Loaded model with Flash Attention 2.")
+                except Exception as e:
+                    logger.warning(f"Flash Attention 2 not available or failed: {e}. Falling back to default attention.")
+                    self.generator = AutoModelForCausalLM.from_pretrained(
+                        self.model_path, 
+                        **model_kwargs
+                    )
+                self.decoder_only = True
+            else:
+                self.generator = AutoModelForSeq2SeqLM.from_pretrained(self.model_path)
+                self.decoder_only = False
+
+        except Exception as e:
+            logger.warning(f"Failed to load model as CausalLM or Config check failed: {e}. Trying fallback.")
+            try:
+                self.generator = AutoModelForSeq2SeqLM.from_pretrained(self.model_path)
+                self.decoder_only = False
+            except Exception:
+                model_kwargs = {
+                    "torch_dtype": torch.bfloat16,
+                    "trust_remote_code": True,
+                    "device_map": "auto",
+                }
+                try:
+                    self.generator = AutoModelForCausalLM.from_pretrained(
+                        self.model_path, 
+                        attn_implementation="flash_attention_2",
+                        **model_kwargs
+                    )
+                    logger.info("Loaded model with Flash Attention 2.")
+                except Exception as e:
+                    logger.warning(f"Flash Attention 2 not available or failed: {e}. Falling back to default attention.")
+                    self.generator = AutoModelForCausalLM.from_pretrained(
+                        self.model_path, 
+                        **model_kwargs
+                    )
+                self.decoder_only = True
+        
         self.generator = self.generator.to(self.device).eval()
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
+        self._initialized = True
+        logger.info("Model initialization complete.")
 
     async def generate(
         self,
@@ -200,20 +265,46 @@ class HuggingFaceGenerator(TacticGenerator):
         theorem_full_name: str,
         theorem_pos: Pos,
         num_samples: int,
+        nl_statement: str = None,
     ) -> List[Tuple[str, float]]:
+        if nl_statement:
+            # Consistent with evaluator_ps_api.py
+            prefix = f"Natural Language Statement: \"{nl_statement}\"\n"
+            prefix += "In the Lean 4 code, `_gold` is the formalization of this Natural Language Statement. `_gen` is a candidate version that we are testing for logical equivalence to `_gold`.\n\n"
+            state = prefix + state
+            
         state = self.template % state
+
         logger.debug(state)
+
+
         tokenized_state = self.tokenizer(
             state, max_length=self.max_inp_seq_len, truncation=True, return_tensors="pt"
         )
         state_ids = tokenized_state.input_ids.to(self.device)
         state_mask = tokenized_state.attention_mask.to(self.device)
 
-        # Generate tactic candidates using beam search.
+        # Import stopping criteria
+        import time
+        from transformers import StoppingCriteria, StoppingCriteriaList
+
+        class TimeLimitStoppingCriteria(StoppingCriteria):
+            def __init__(self, start_time, timeout_seconds):
+                self.start_time = start_time
+                self.timeout_seconds = timeout_seconds
+
+            def __call__(self, input_ids, scores, **kwargs):
+                return time.time() - self.start_time > self.timeout_seconds
+
+        # Set a strict generation timeout (e.g., 180 seconds)
+        generation_timeout = 180.0 
+        stopping_criteria = StoppingCriteriaList([TimeLimitStoppingCriteria(time.time(), generation_timeout)])
+
+        # Generate tactic candidates using beam search with timeout
         output = self.generator.generate(
             input_ids=state_ids,
             attention_mask=state_mask,
-            max_length=self.max_oup_seq_len,
+            max_new_tokens=self.max_oup_seq_len,
             num_beams=num_samples,
             length_penalty=self.length_penalty,
             do_sample=False,
@@ -221,6 +312,7 @@ class HuggingFaceGenerator(TacticGenerator):
             early_stopping=False,
             output_scores=True,
             return_dict_in_generate=True,
+            stopping_criteria=stopping_criteria
         )
 
         # Return the output.
@@ -313,8 +405,15 @@ class VllmGenerator(TacticGenerator):
         theorem_full_name: str,
         theorem_pos: Pos,
         num_samples: int,
+        nl_statement: str = None,
     ) -> List[Tuple[str, float]]:
+        if nl_statement:
+            prefix = f"Natural Language Statement: \"{nl_statement}\"\n"
+            prefix += "In the Lean 4 code, `_gold` is the formalization of this Natural Language Statement. `_gen` is a candidate version that we are testing for logical equivalence to `_gold`.\n\n"
+            state = prefix + state
+            
         prompt = self.template % state
+
         response = await self.vllm_actor.generate.remote(prompt, num_samples)
         return [
             (remove_marks(x.text).strip(), x.cumulative_logprob)

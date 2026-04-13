@@ -51,6 +51,7 @@ class SearchResult:
     total_time: float
     num_total_nodes: int
     num_searched_nodes: int
+    error_message: Optional[str] = None
 
 
 class BestFirstSearchProver:
@@ -65,7 +66,6 @@ class BestFirstSearchProver:
         debug: bool,
     ) -> None:
         self.tac_gen = tac_gen
-        self.tac_gen.initialize()
         self.timeout = timeout
         self.max_expansions = max_expansions
         self.num_sampled_tactics = num_sampled_tactics
